@@ -96,7 +96,7 @@ def get_data(datadir: str, task: str, split: str | None, del_intmd_files: bool) 
 
 
 def uncompress_data(compressed_dir: str) -> str:
-    import uncompress
+    import fairchem.core.scripts.uncompress as uncompress
 
     parser = uncompress.get_parser()
     args, _ = parser.parse_known_args()
@@ -107,7 +107,7 @@ def uncompress_data(compressed_dir: str) -> str:
 
 
 def preprocess_data(uncompressed_dir: str, output_path: str) -> None:
-    import preprocess_ef as preprocess
+    import fairchem.core.scripts.preprocess_ef as preprocess
 
     parser = preprocess.get_parser()
     args, _ = parser.parse_known_args()
