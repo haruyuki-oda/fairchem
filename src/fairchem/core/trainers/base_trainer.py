@@ -7,14 +7,17 @@ LICENSE file in the root directory of this source tree.
 
 from __future__ import annotations
 
+import copy
 import datetime
 import errno
 import logging
 import os
 import random
+import sys
 from abc import ABC, abstractmethod
+from functools import partial
 from itertools import chain
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import numpy.typing as npt
@@ -27,21 +30,34 @@ from tqdm import tqdm
 
 from fairchem.core import __version__
 from fairchem.core.common import distutils, gp_utils
-from fairchem.core.common.data_parallel import BalancedBatchSampler, OCPCollater
+from fairchem.core.common.data_parallel import BalancedBatchSampler
 from fairchem.core.common.registry import registry
+from fairchem.core.common.slurm import (
+    add_timestamp_id_to_submission_pickle,
+)
 from fairchem.core.common.typing import assert_is_instance as aii
 from fairchem.core.common.typing import none_throws
 from fairchem.core.common.utils import (
     get_commit_hash,
     get_loss_module,
     load_state_dict,
+    match_state_dict,
     save_checkpoint,
     update_config,
 )
+from fairchem.core.datasets import data_list_collater
+from fairchem.core.datasets.base_dataset import create_dataset
 from fairchem.core.modules.evaluator import Evaluator
 from fairchem.core.modules.exponential_moving_average import ExponentialMovingAverage
 from fairchem.core.modules.loss import DDPLoss
-from fairchem.core.modules.normalizer import Normalizer
+from fairchem.core.modules.normalization.element_references import (
+    create_element_references,
+    load_references_from_config,
+)
+from fairchem.core.modules.normalization.normalizer import (
+    create_normalizer,
+    load_normalizers_from_config,
+)
 from fairchem.core.modules.scaling.compat import load_scales_compat
 from fairchem.core.modules.scaling.util import ensure_fitted
 from fairchem.core.modules.scheduler import LRScheduler
@@ -54,27 +70,29 @@ if TYPE_CHECKING:
 class BaseTrainer(ABC):
     def __init__(
         self,
-        task,
-        model,
-        outputs,
-        dataset,
-        optimizer,
-        loss_functions,
-        evaluation_metrics,
+        task: dict[str, str | Any],
+        model: dict[str, Any],
+        outputs: dict[str, str | int],
+        dataset: dict[str, str | float],
+        optimizer: dict[str, str | float],
+        loss_functions: dict[str, str | float],
+        evaluation_metrics: dict[str, str],
         identifier: str,
+        # TODO: dealing with local rank is dangerous
+        # T201111838 remove this and use CUDA_VISIBILE_DEVICES instead so trainers don't need to know about which devie to use
+        local_rank: int,
         timestamp_id: str | None = None,
         run_dir: str | None = None,
         is_debug: bool = False,
         print_every: int = 100,
         seed: int | None = None,
         logger: str = "wandb",
-        local_rank: int = 0,
         amp: bool = False,
         cpu: bool = False,
         name: str = "ocp",
         slurm=None,
-        noddp: bool = False,
         gp_gpus: int | None = None,
+        inference_only: bool = False,
     ) -> None:
         if slurm is None:
             slurm = {}
@@ -85,6 +103,7 @@ class BaseTrainer(ABC):
         self.step = 0
 
         if torch.cuda.is_available() and not self.cpu:
+            logging.info(f"local rank base: {local_rank}")
             self.device = torch.device(f"cuda:{local_rank}")
         else:
             self.device = torch.device("cpu")
@@ -106,8 +125,7 @@ class BaseTrainer(ABC):
         self.config = {
             "task": task,
             "trainer": name,
-            "model": aii(model.pop("name"), str),
-            "model_attributes": model,
+            "model": model,
             "outputs": outputs,
             "optim": optimizer,
             "loss_functions": loss_functions,
@@ -131,7 +149,6 @@ class BaseTrainer(ABC):
                 ),
             },
             "slurm": slurm,
-            "noddp": noddp,
             "gp_gpus": gp_gpus,
         }
         # AMP Scaler
@@ -149,6 +166,12 @@ class BaseTrainer(ABC):
             self.config["slurm"]["folder"] = self.config["slurm"]["folder"].replace(
                 "%j", self.config["slurm"]["job_id"]
             )
+            if distutils.is_master():
+                add_timestamp_id_to_submission_pickle(
+                    self.config["slurm"]["folder"],
+                    self.config["slurm"]["job_id"],
+                    self.timestamp_id,
+                )
 
         # Define datasets
         if isinstance(dataset, list):
@@ -183,7 +206,16 @@ class BaseTrainer(ABC):
         if distutils.is_master():
             logging.info(yaml.dump(self.config, default_flow_style=False))
 
-        self.load()
+        # define attributes for readability
+        self.elementrefs = {}
+        self.normalizers = {}
+        self.train_dataset = None
+        self.val_dataset = None
+        self.test_dataset = None
+        self.best_val_metric = None
+        self.primary_metric = None
+
+        self.load(inference_only)
 
     @abstractmethod
     def train(self, disable_eval_tqdm: bool = False) -> None:
@@ -202,17 +234,24 @@ class BaseTrainer(ABC):
             timestamp_str += "-" + suffix
         return timestamp_str
 
-    def load(self) -> None:
+    def load(self, inference_only: bool) -> None:
         self.load_seed_from_config()
         self.load_logger()
-        self.load_datasets()
         self.load_task()
         self.load_model()
-        self.load_loss()
-        self.load_optimizer()
-        self.load_extras()
 
-    def set_seed(self, seed) -> None:
+        if inference_only is False:
+            self.load_datasets()
+            self.load_references_and_normalizers()
+            self.load_loss()
+            self.load_optimizer()
+            self.load_extras()
+
+        if self.config["optim"].get("load_datasets_and_model_then_exit", False):
+            sys.exit(0)
+
+    @staticmethod
+    def set_seed(seed) -> None:
         # https://pytorch.org/docs/stable/notes/randomness.html
         random.seed(seed)
         np.random.seed(seed)
@@ -241,12 +280,16 @@ class BaseTrainer(ABC):
     def get_sampler(
         self, dataset, batch_size: int, shuffle: bool
     ) -> BalancedBatchSampler:
-        if "load_balancing" in self.config["optim"]:
-            balancing_mode = self.config["optim"]["load_balancing"]
-            force_balancing = True
+        balancing_mode = self.config["optim"].get("load_balancing", None)
+        on_error = self.config["optim"].get("load_balancing_on_error", None)
+        if balancing_mode is not None:
+            if on_error is None:
+                on_error = "raise"
         else:
             balancing_mode = "atoms"
-            force_balancing = False
+
+        if on_error is None:
+            on_error = "warn_and_no_balance"
 
         if gp_utils.initialized():
             num_replicas = gp_utils.get_dp_world_size()
@@ -262,26 +305,36 @@ class BaseTrainer(ABC):
             device=self.device,
             mode=balancing_mode,
             shuffle=shuffle,
-            force_balancing=force_balancing,
+            on_error=on_error,
             seed=self.config["cmd"]["seed"],
         )
 
     def get_dataloader(self, dataset, sampler) -> DataLoader:
         return DataLoader(
             dataset,
-            collate_fn=self.ocp_collater,
+            collate_fn=self.collater,
             num_workers=self.config["optim"]["num_workers"],
             pin_memory=True,
             batch_sampler=sampler,
         )
 
     def load_datasets(self) -> None:
-        self.ocp_collater = OCPCollater(
-            self.config["model_attributes"].get("otf_graph", False)
+        self.collater = partial(
+            data_list_collater, otf_graph=self.config["model"].get("otf_graph", False)
         )
         self.train_loader = None
         self.val_loader = None
         self.test_loader = None
+
+        # This is hacky and scheduled to be removed next BE week
+        # move ['X_split_settings'] to ['splits'][X]
+        def convert_settings_to_split_settings(config, split_name):
+            config = copy.deepcopy(config)  # make sure we dont modify the original
+            if f"{split_name}_split_settings" in config:
+                config["splits"] = {
+                    split_name: config.pop(f"{split_name}_split_settings")
+                }
+            return config
 
         # load train, val, test datasets
         if "src" in self.config["dataset"]:
@@ -289,9 +342,10 @@ class BaseTrainer(ABC):
                 f"Loading dataset: {self.config['dataset'].get('format', 'lmdb')}"
             )
 
-            self.train_dataset = registry.get_dataset_class(
-                self.config["dataset"].get("format", "lmdb")
-            )(self.config["dataset"])
+            self.train_dataset = create_dataset(
+                convert_settings_to_split_settings(self.config["dataset"], "train"),
+                "train",
+            )
             self.train_sampler = self.get_sampler(
                 self.train_dataset,
                 self.config["optim"]["batch_size"],
@@ -302,6 +356,16 @@ class BaseTrainer(ABC):
                 self.train_sampler,
             )
 
+        if (
+            "first_n" in self.config["dataset"]
+            or "sample_n" in self.config["dataset"]
+            or "max_atom" in self.config["dataset"]
+        ):
+            logging.warning(
+                "Dataset attributes (first_n/sample_n/max_atom) passed to all datasets! Please don't do this, its dangerous!\n"
+                + "Add them under each dataset 'train_split_settings'/'val_split_settings'/'test_split_settings'"
+            )
+
         if "src" in self.config["val_dataset"]:
             if self.config["val_dataset"].get("use_train_settings", True):
                 val_config = self.config["dataset"].copy()
@@ -309,9 +373,9 @@ class BaseTrainer(ABC):
             else:
                 val_config = self.config["val_dataset"]
 
-            self.val_dataset = registry.get_dataset_class(
-                val_config.get("format", "lmdb")
-            )(val_config)
+            self.val_dataset = create_dataset(
+                convert_settings_to_split_settings(val_config, "val"), "val"
+            )
             self.val_sampler = self.get_sampler(
                 self.val_dataset,
                 self.config["optim"].get(
@@ -331,9 +395,9 @@ class BaseTrainer(ABC):
             else:
                 test_config = self.config["test_dataset"]
 
-            self.test_dataset = registry.get_dataset_class(
-                test_config.get("format", "lmdb")
-            )(test_config)
+            self.test_dataset = create_dataset(
+                convert_settings_to_split_settings(test_config, "test"), "test"
+            )
             self.test_sampler = self.get_sampler(
                 self.test_dataset,
                 self.config["optim"].get(
@@ -368,20 +432,72 @@ class BaseTrainer(ABC):
                 self.relax_sampler,
             )
 
-    def load_task(self):
-        # Normalizer for the dataset.
-
+    def load_references_and_normalizers(self):
+        """Load or create element references and normalizers from config"""
         # Is it troublesome that we assume any normalizer info is in train? What if there is no
         # training dataset? What happens if we just specify a test
-        normalizer = self.config["dataset"].get("transforms", {}).get("normalizer", {})
-        self.normalizers = {}
-        if normalizer:
-            for target in normalizer:
-                self.normalizers[target] = Normalizer(
-                    mean=normalizer[target].get("mean", 0),
-                    std=normalizer[target].get("stdev", 1),
+
+        elementref_config = (
+            self.config["dataset"].get("transforms", {}).get("element_references")
+        )
+        norms_config = self.config["dataset"].get("transforms", {}).get("normalizer")
+        elementrefs, normalizers = {}, {}
+        if distutils.is_master():
+            if elementref_config is not None:
+                # put them in a list to allow broadcasting python objects
+                elementrefs = load_references_from_config(
+                    elementref_config,
+                    dataset=self.train_dataset,
+                    seed=self.config["cmd"]["seed"],
+                    checkpoint_dir=(
+                        self.config["cmd"]["checkpoint_dir"]
+                        if not self.is_debug
+                        else None
+                    ),
                 )
 
+            if norms_config is not None:
+                normalizers = load_normalizers_from_config(
+                    norms_config,
+                    dataset=self.train_dataset,
+                    seed=self.config["cmd"]["seed"],
+                    checkpoint_dir=(
+                        self.config["cmd"]["checkpoint_dir"]
+                        if not self.is_debug
+                        else None
+                    ),
+                    element_references=elementrefs,
+                )
+
+                # log out the values that will be used.
+                for output, normalizer in normalizers.items():
+                    logging.info(
+                        f"Normalization values for output {output}: mean={normalizer.mean.item()}, rmsd={normalizer.rmsd.item()}."
+                    )
+
+        # put them in a list to broadcast them
+        elementrefs, normalizers = [elementrefs], [normalizers]
+        distutils.broadcast_object_list(
+            object_list=elementrefs, src=0, device=self.device
+        )
+        distutils.broadcast_object_list(
+            object_list=normalizers, src=0, device=self.device
+        )
+        # make sure element refs and normalizers are on this device
+        self.elementrefs.update(
+            {
+                output: elementref.to(self.device)
+                for output, elementref in elementrefs[0].items()
+            }
+        )
+        self.normalizers.update(
+            {
+                output: normalizer.to(self.device)
+                for output, normalizer in normalizers[0].items()
+            }
+        )
+
+    def load_task(self):
         self.output_targets = {}
         for target_name in self.config["outputs"]:
             self.output_targets[target_name] = self.config["outputs"][target_name]
@@ -421,28 +537,20 @@ class BaseTrainer(ABC):
     def load_model(self) -> None:
         # Build model
         if distutils.is_master():
-            logging.info(f"Loading model: {self.config['model']}")
+            logging.info(f"Loading model: {self.config['model']['name']}")
 
-        # TODO: depreicated, remove.
-        bond_feat_dim = None
-        bond_feat_dim = self.config["model_attributes"].get("num_gaussians", 50)
-
-        loader = self.train_loader or self.val_loader or self.test_loader
-        self.model = registry.get_model_class(self.config["model"])(
-            loader.dataset[0].x.shape[-1]
-            if loader
-            and hasattr(loader.dataset[0], "x")
-            and loader.dataset[0].x is not None
-            else None,
-            bond_feat_dim,
-            1,
-            **self.config["model_attributes"],
+        model_config_copy = copy.deepcopy(self.config["model"])
+        model_name = model_config_copy.pop("name")
+        self.model = registry.get_model_class(model_name)(
+            **model_config_copy,
         ).to(self.device)
+
+        num_params = sum(p.numel() for p in self.model.parameters())
 
         if distutils.is_master():
             logging.info(
                 f"Loaded {self.model.__class__.__name__} with "
-                f"{self.model.num_params} parameters."
+                f"{num_params} parameters."
             )
 
         if self.logger is not None:
@@ -452,10 +560,12 @@ class BaseTrainer(ABC):
                 self.logger.watch(
                     self.model, log_freq=int(self.config["logger"]["watch"])
                 )
-            self.logger.log_summary({"num_params": self.model.num_params})
+            self.logger.log_summary({"num_params": num_params})
 
-        if distutils.initialized() and not self.config["noddp"]:
-            self.model = DistributedDataParallel(self.model, device_ids=[self.device])
+        if distutils.initialized():
+            self.model = DistributedDataParallel(
+                self.model,
+            )
 
     @property
     def _unwrapped_model(self):
@@ -465,54 +575,41 @@ class BaseTrainer(ABC):
         return module
 
     def load_checkpoint(
-        self, checkpoint_path: str, checkpoint: dict | None = None
+        self,
+        checkpoint_path: str,
+        checkpoint: dict | None = None,
+        inference_only: bool | None = None,
     ) -> None:
+        map_location = torch.device("cpu") if self.cpu else self.device
         if checkpoint is None:
             if not os.path.isfile(checkpoint_path):
                 raise FileNotFoundError(
                     errno.ENOENT, "Checkpoint file not found", checkpoint_path
                 )
             logging.info(f"Loading checkpoint from: {checkpoint_path}")
-            map_location = torch.device("cpu") if self.cpu else self.device
             checkpoint = torch.load(checkpoint_path, map_location=map_location)
 
-        self.epoch = checkpoint.get("epoch", 0)
-        self.step = checkpoint.get("step", 0)
-        self.best_val_metric = checkpoint.get("best_val_metric", None)
-        self.primary_metric = checkpoint.get("primary_metric", None)
+        # attributes that are necessary for training and validation
+        inference_only = self.train_dataset is None or inference_only
+        if inference_only is False:
+            self.epoch = checkpoint.get("epoch", 0)
+            self.step = checkpoint.get("step", 0)
+            self.best_val_metric = checkpoint.get("best_val_metric", None)
+            self.primary_metric = checkpoint.get("primary_metric", None)
 
-        # Match the "module." count in the keys of model and checkpoint state_dict
-        # DataParallel model has 1 "module.",  DistributedDataParallel has 2 "module."
-        # Not using either of the above two would have no "module."
+            if "optimizer" in checkpoint:
+                self.optimizer.load_state_dict(checkpoint["optimizer"])
+            if "scheduler" in checkpoint and checkpoint["scheduler"] is not None:
+                self.scheduler.scheduler.load_state_dict(checkpoint["scheduler"])
 
-        ckpt_key_count = next(iter(checkpoint["state_dict"])).count("module")
-        mod_key_count = next(iter(self.model.state_dict())).count("module")
-        key_count_diff = mod_key_count - ckpt_key_count
-
-        if key_count_diff > 0:
-            new_dict = {
-                key_count_diff * "module." + k: v
-                for k, v in checkpoint["state_dict"].items()
-            }
-        elif key_count_diff < 0:
-            new_dict = {
-                k[len("module.") * abs(key_count_diff) :]: v
-                for k, v in checkpoint["state_dict"].items()
-            }
-        else:
-            new_dict = checkpoint["state_dict"]
-
-        strict = self.config["task"].get("strict_load", True)
-        load_state_dict(self.model, new_dict, strict=strict)
-
-        if "optimizer" in checkpoint:
-            self.optimizer.load_state_dict(checkpoint["optimizer"])
-        if "scheduler" in checkpoint and checkpoint["scheduler"] is not None:
-            self.scheduler.scheduler.load_state_dict(checkpoint["scheduler"])
         if "ema" in checkpoint and checkpoint["ema"] is not None:
             self.ema.load_state_dict(checkpoint["ema"])
         else:
             self.ema = None
+
+        new_dict = match_state_dict(self.model.state_dict(), checkpoint["state_dict"])
+        strict = self.config.get("task", {}).get("strict_load", True)
+        load_state_dict(self.model, new_dict, strict=strict)
 
         scale_dict = checkpoint.get("scale_dict", None)
         if scale_dict:
@@ -523,7 +620,7 @@ class BaseTrainer(ABC):
             )
             load_scales_compat(self._unwrapped_model, scale_dict)
 
-        for key in checkpoint["normalizers"]:
+        for key, state_dict in checkpoint["normalizers"].items():
             ### Convert old normalizer keys to new target keys
             if key == "target":
                 target_key = "energy"
@@ -532,10 +629,24 @@ class BaseTrainer(ABC):
             else:
                 target_key = key
 
-            if target_key in self.normalizers:
-                self.normalizers[target_key].load_state_dict(
-                    checkpoint["normalizers"][key]
-                )
+            if target_key not in self.normalizers:
+                self.normalizers[target_key] = create_normalizer(state_dict=state_dict)
+            else:
+                mkeys = self.normalizers[target_key].load_state_dict(state_dict)
+                assert len(mkeys.missing_keys) == 0
+                assert len(mkeys.unexpected_keys) == 0
+
+            self.normalizers[target_key].to(map_location)
+
+        for key, state_dict in checkpoint.get("elementrefs", {}).items():
+            if key not in self.elementrefs:
+                self.elementrefs[key] = create_element_references(state_dict=state_dict)
+            else:
+                mkeys = self.elementrefs[key].load_state_dict(state_dict)
+                assert len(mkeys.missing_keys) == 0
+                assert len(mkeys.unexpected_keys) == 0
+
+            self.elementrefs[key].to(map_location)
 
         if self.scaler and checkpoint["amp"]:
             self.scaler.load_state_dict(checkpoint["amp"])
@@ -632,30 +743,40 @@ class BaseTrainer(ABC):
         training_state: bool = True,
     ) -> str | None:
         if not self.is_debug and distutils.is_master():
+            state = {
+                "state_dict": self.model.state_dict(),
+                "normalizers": {
+                    key: value.state_dict() for key, value in self.normalizers.items()
+                },
+                "elementrefs": {
+                    key: value.state_dict() for key, value in self.elementrefs.items()
+                },
+                "config": self.config,
+                "val_metrics": metrics,
+                "amp": self.scaler.state_dict() if self.scaler else None,
+            }
             if training_state:
-                return save_checkpoint(
+                state.update(
                     {
                         "epoch": self.epoch,
                         "step": self.step,
-                        "state_dict": self.model.state_dict(),
                         "optimizer": self.optimizer.state_dict(),
-                        "scheduler": self.scheduler.scheduler.state_dict()
-                        if self.scheduler.scheduler_type != "Null"
-                        else None,
-                        "normalizers": {
-                            key: value.state_dict()
-                            for key, value in self.normalizers.items()
-                        },
+                        "scheduler": (
+                            self.scheduler.scheduler.state_dict()
+                            if self.scheduler.scheduler_type != "Null"
+                            else None
+                        ),
                         "config": self.config,
-                        "val_metrics": metrics,
                         "ema": self.ema.state_dict() if self.ema else None,
-                        "amp": self.scaler.state_dict() if self.scaler else None,
                         "best_val_metric": self.best_val_metric,
                         "primary_metric": self.evaluation_metrics.get(
                             "primary_metric",
                             self.evaluator.task_primary_metric[self.name],
                         ),
                     },
+                )
+                ckpt_path = save_checkpoint(
+                    state,
                     checkpoint_dir=self.config["cmd"]["checkpoint_dir"],
                     checkpoint_file=checkpoint_file,
                 )
@@ -664,22 +785,13 @@ class BaseTrainer(ABC):
                     self.ema.store()
                     self.ema.copy_to()
                 ckpt_path = save_checkpoint(
-                    {
-                        "state_dict": self.model.state_dict(),
-                        "normalizers": {
-                            key: value.state_dict()
-                            for key, value in self.normalizers.items()
-                        },
-                        "config": self.config,
-                        "val_metrics": metrics,
-                        "amp": self.scaler.state_dict() if self.scaler else None,
-                    },
+                    state,
                     checkpoint_dir=self.config["cmd"]["checkpoint_dir"],
                     checkpoint_file=checkpoint_file,
                 )
                 if self.ema:
                     self.ema.restore()
-                return ckpt_path
+            return ckpt_path
         return None
 
     def update_best(
@@ -707,6 +819,22 @@ class BaseTrainer(ABC):
                     results_file="predictions",
                     disable_tqdm=disable_eval_tqdm,
                 )
+
+    def _aggregate_metrics(self, metrics):
+        aggregated_metrics = {}
+        for k in metrics:
+            aggregated_metrics[k] = {
+                "total": distutils.all_reduce(
+                    metrics[k]["total"], average=False, device=self.device
+                ),
+                "numel": distutils.all_reduce(
+                    metrics[k]["numel"], average=False, device=self.device
+                ),
+            }
+            aggregated_metrics[k]["metric"] = (
+                aggregated_metrics[k]["total"] / aggregated_metrics[k]["numel"]
+            )
+        return aggregated_metrics
 
     @torch.no_grad()
     def validate(self, split: str = "val", disable_tqdm: bool = False):
@@ -749,20 +877,7 @@ class BaseTrainer(ABC):
             metrics = self._compute_metrics(out, batch, evaluator, metrics)
             metrics = evaluator.update("loss", loss.item(), metrics)
 
-        aggregated_metrics = {}
-        for k in metrics:
-            aggregated_metrics[k] = {
-                "total": distutils.all_reduce(
-                    metrics[k]["total"], average=False, device=self.device
-                ),
-                "numel": distutils.all_reduce(
-                    metrics[k]["numel"], average=False, device=self.device
-                ),
-            }
-            aggregated_metrics[k]["metric"] = (
-                aggregated_metrics[k]["total"] / aggregated_metrics[k]["numel"]
-            )
-        metrics = aggregated_metrics
+        metrics = self._aggregate_metrics(metrics)
 
         log_dict = {k: metrics[k]["metric"] for k in metrics}
         log_dict.update({"epoch": self.epoch})

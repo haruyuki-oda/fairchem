@@ -23,7 +23,8 @@ Boes, J. R., Groenenboom, M. C., Keith, J. A., & Kitchin, J. R. (2016). Neural n
 You can retrieve the dataset below. In this notebook we learn how to do "mass inference" without an ASE calculator. You do this by creating a config.yml file, and running the `main.py` command line utility.
 
 ```{code-cell} ipython3
-! wget https://figshare.com/ndownloader/files/11948267 -O data.db
+from fairchem.core.scripts.download_large_files import download_file_group
+download_file_group('docs')
 ```
 
 
@@ -97,7 +98,7 @@ yml = generate_yml_config(checkpoint_path, 'config.yml',
 yml
 ```
 
-It is a good idea to redirect the output to a file. If the output gets too large here, the notebook may fail to save. Normally I would use a redirect like `2&>1`, but this does not work with the main.py method. An alternative here is to open a terminal and run it there.
+It is a good idea to redirect the output to a file. If the output gets too large here, the notebook may fail to save. Normally I would use a redirect like `2&>1`, but this does not work with the main.py method. An alternative here is to open a terminal and run it there. If you have a gpu or multiple gpus, you should use the flag --num-gpus=<number of gpus> and remove the --cpu flag.
 
 ```{code-cell} ipython3
 %%capture inference
@@ -105,7 +106,7 @@ import time
 from fairchem.core.common.tutorial_utils import fairchem_main
 
 t0 = time.time()
-! python {fairchem_main()} --mode predict --config-yml {yml} --checkpoint {checkpoint_path} --amp
+! python {fairchem_main()} --mode predict --config-yml {yml} --checkpoint {checkpoint_path} --cpu
 print(f'Elapsed time = {time.time() - t0:1.1f} seconds')
 ```
 

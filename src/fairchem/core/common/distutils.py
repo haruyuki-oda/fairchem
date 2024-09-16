@@ -10,15 +10,17 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
-from typing import TypeVar
+from datetime import timedelta
+from typing import Any, TypeVar
 
 import torch
 import torch.distributed as dist
+from torch.distributed.elastic.utils.distributed import get_free_port
 
 from fairchem.core.common.typing import none_throws
 
 T = TypeVar("T")
-
+DISTRIBUTED_PORT = 13356
 
 def os_environ_get_or_throw(x: str) -> str:
     if x not in os.environ:
@@ -27,6 +29,7 @@ def os_environ_get_or_throw(x: str) -> str:
 
 
 def setup(config) -> None:
+    timeout = timedelta(minutes=config.get("timeout", 30))
     if config["submit"]:
         node_list = os.environ.get("SLURM_STEP_NODELIST")
         if node_list is None:
@@ -38,7 +41,7 @@ def setup(config) -> None:
                 )
                 config["init_method"] = "tcp://{host}:{port}".format(
                     host=hostnames.split()[0].decode("utf-8"),
-                    port=config["distributed_port"],
+                    port=DISTRIBUTED_PORT,
                 )
                 nnodes = int(os_environ_get_or_throw("SLURM_NNODES"))
                 ntasks_per_node = os.environ.get("SLURM_NTASKS_PER_NODE")
@@ -65,13 +68,15 @@ def setup(config) -> None:
                 )
 
                 # ensures GPU0 does not have extra context/higher peak memory
+                logging.info(f"local rank: {config['local_rank']}, visible devices: {os.environ['CUDA_VISIBLE_DEVICES']}")
                 torch.cuda.set_device(config["local_rank"])
 
                 dist.init_process_group(
-                    backend=config["distributed_backend"],
+                    backend="nccl",
                     init_method=config["init_method"],
                     world_size=config["world_size"],
                     rank=config["rank"],
+                    timeout=timeout,
                 )
             except subprocess.CalledProcessError as e:  # scontrol failed
                 raise e
@@ -95,10 +100,17 @@ def setup(config) -> None:
             rank=world_rank,
             world_size=world_size,
             init_method="env://",
+            timeout=timeout,
         )
     else:
-        config["local_rank"] = int(os.environ.get("LOCAL_RANK", config["local_rank"]))
-        dist.init_process_group(backend="nccl")
+        if not os.environ.get("MASTER_ADDR"):
+            assert config["world_size"] == 1, "Can only setup master address and port at this point for a single rank, otherwise we assume the processes and the comm addr/port have already been setup"
+            os.environ["MASTER_ADDR"] = "localhost"
+            os.environ["MASTER_PORT"] = str(get_free_port())
+            os.environ["LOCAL_RANK"] = "0"
+            os.environ["RANK"] = "0"
+        config["local_rank"] = int(os.environ.get("LOCAL_RANK"))
+        dist.init_process_group(backend=config["distributed_backend"], rank=int(os.environ.get("RANK")), world_size=config["world_size"], timeout=timeout)
 
 
 def cleanup() -> None:
@@ -135,6 +147,14 @@ def broadcast(
     dist.broadcast(tensor, src, group, async_op)
 
 
+def broadcast_object_list(
+    object_list: list[Any], src: int, group=dist.group.WORLD, device: str | None = None
+) -> None:
+    if get_world_size() == 1:
+        return
+    dist.broadcast_object_list(object_list, src, group, device)
+
+
 def all_reduce(
     data, group=dist.group.WORLD, average: bool = False, device=None
 ) -> torch.Tensor:
@@ -144,7 +164,7 @@ def all_reduce(
     if not isinstance(data, torch.Tensor):
         tensor = torch.tensor(data)
     if device is not None:
-        tensor = tensor.cuda(device)
+        tensor = tensor.to(device)
     dist.all_reduce(tensor, group=group)
     if average:
         tensor /= get_world_size()
@@ -162,7 +182,7 @@ def all_gather(data, group=dist.group.WORLD, device=None) -> list[torch.Tensor]:
     if not isinstance(data, torch.Tensor):
         tensor = torch.tensor(data)
     if device is not None:
-        tensor = tensor.cuda(device)
+        tensor = tensor.to(device)
     tensor_list = [tensor.new_zeros(tensor.shape) for _ in range(get_world_size())]
     dist.all_gather(tensor_list, tensor, group=group)
     if not isinstance(data, torch.Tensor):

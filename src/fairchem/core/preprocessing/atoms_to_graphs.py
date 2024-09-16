@@ -13,6 +13,7 @@ import ase.db.sqlite
 import ase.io.trajectory
 import numpy as np
 import torch
+from ase.geometry import wrap_positions
 from torch_geometric.data import Data
 
 from fairchem.core.common.utils import collate
@@ -114,7 +115,6 @@ class AtomsToGraphs:
         _c_index, _n_index, _offsets, n_distance = struct.get_neighbor_list(
             r=self.radius, numerical_tol=0, exclude_self=True
         )
-
         _nonmax_idx = []
         for i in range(len(atoms)):
             idx_i = (_c_index == i).nonzero()[0]
@@ -147,6 +147,23 @@ class AtomsToGraphs:
 
         return edge_index, edge_distances, cell_offsets
 
+    def get_edge_distance_vec(
+        self,
+        pos,
+        edge_index,
+        cell,
+        cell_offsets,
+    ):
+        row, col = edge_index
+        distance_vectors = pos[row] - pos[col]
+
+        # correct for pbc
+        cell = torch.repeat_interleave(cell, edge_index.shape[1], dim=0)
+        offsets = cell_offsets.float().view(-1, 1, 3).bmm(cell.float()).view(-1, 3)
+        distance_vectors += offsets
+
+        return distance_vectors
+
     def convert(self, atoms: ase.Atoms, sid=None):
         """Convert a single atomic structure to a graph.
 
@@ -163,10 +180,16 @@ class AtomsToGraphs:
         """
 
         # set the atomic numbers, positions, and cell
+        positions = np.array(atoms.get_positions(), copy=True)
+        pbc = np.array(atoms.pbc, copy=True)
+        cell = np.array(atoms.get_cell(complete=True), copy=True)
+        positions = wrap_positions(positions, cell, pbc=pbc, eps=0)
+
         atomic_numbers = torch.Tensor(atoms.get_atomic_numbers())
-        positions = torch.Tensor(atoms.get_positions())
-        cell = torch.Tensor(np.array(atoms.get_cell())).view(1, 3, 3)
+        positions = torch.from_numpy(positions).float()
+        cell = torch.from_numpy(cell).view(1, 3, 3).float()
         natoms = positions.shape[0]
+
         # initialized to torch.zeros(natoms) if tags missing.
         # https://wiki.fysik.dtu.dk/ase/_modules/ase/atoms.html#Atoms.get_tags
         tags = torch.Tensor(atoms.get_tags())
@@ -187,13 +210,18 @@ class AtomsToGraphs:
         # optionally include other properties
         if self.r_edges:
             # run internal functions to get padded indices and distances
-            split_idx_dist = self._get_neighbors_pymatgen(atoms)
+            atoms_copy = atoms.copy()
+            atoms_copy.set_positions(positions)
+            split_idx_dist = self._get_neighbors_pymatgen(atoms_copy)
             edge_index, edge_distances, cell_offsets = self._reshape_features(
                 *split_idx_dist
             )
 
             data.edge_index = edge_index
             data.cell_offsets = cell_offsets
+            data.edge_distance_vec = self.get_edge_distance_vec(positions, edge_index, cell, cell_offsets)
+
+            del atoms_copy
         if self.r_energy:
             energy = atoms.get_potential_energy(apply_constraint=False)
             data.energy = energy

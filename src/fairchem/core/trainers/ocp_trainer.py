@@ -11,6 +11,7 @@ import logging
 import os
 from collections import defaultdict
 from itertools import chain
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -24,6 +25,9 @@ from fairchem.core.common.utils import cg_change_mat, check_traj_files, irreps_s
 from fairchem.core.modules.evaluator import Evaluator
 from fairchem.core.modules.scaling.util import ensure_fitted
 from fairchem.core.trainers.base_trainer import BaseTrainer
+
+if TYPE_CHECKING:
+    from torch_geometric.data import Batch
 
 
 @registry.register_trainer("ocp")
@@ -59,38 +63,37 @@ class OCPTrainer(BaseTrainer):
             (default: :obj:`None`)
         logger (str, optional): Type of logger to be used.
             (default: :obj:`wandb`)
-        local_rank (int, optional): Local rank of the process, only applicable for distributed training.
-            (default: :obj:`0`)
         amp (bool, optional): Run using automatic mixed precision.
             (default: :obj:`False`)
         slurm (dict): Slurm configuration. Currently just for keeping track.
             (default: :obj:`{}`)
-        noddp (bool, optional): Run model without DDP.
     """
 
     def __init__(
         self,
-        task,
-        model,
-        outputs,
-        dataset,
-        optimizer,
-        loss_functions,
-        evaluation_metrics,
-        identifier,
-        timestamp_id=None,
-        run_dir=None,
-        is_debug=False,
-        print_every=100,
-        seed=None,
-        logger="wandb",
-        local_rank=0,
-        amp=False,
-        cpu=False,
+        task: dict[str, str | Any],
+        model: dict[str, Any],
+        outputs: dict[str, str | int],
+        dataset: dict[str, str | float],
+        optimizer: dict[str, str | float],
+        loss_functions: dict[str, str | float],
+        evaluation_metrics: dict[str, str],
+        identifier: str,
+        # TODO: dealing with local rank is dangerous
+        # T201111838 remove this and use CUDA_VISIBILE_DEVICES instead so trainers don't need to know about which devie to use
+        local_rank: int,
+        timestamp_id: str | None = None,
+        run_dir: str | None = None,
+        is_debug: bool = False,
+        print_every: int = 100,
+        seed: int | None = None,
+        logger: str = "wandb",
+        amp: bool = False,
+        cpu: bool = False,
+        name: str = "ocp",
         slurm=None,
-        noddp=False,
-        name="ocp",
-        gp_gpus=None,
+        gp_gpus: int | None = None,
+        inference_only: bool = False,
     ):
         if slurm is None:
             slurm = {}
@@ -103,19 +106,19 @@ class OCPTrainer(BaseTrainer):
             loss_functions=loss_functions,
             evaluation_metrics=evaluation_metrics,
             identifier=identifier,
+            local_rank=local_rank,
             timestamp_id=timestamp_id,
             run_dir=run_dir,
             is_debug=is_debug,
             print_every=print_every,
             seed=seed,
             logger=logger,
-            local_rank=local_rank,
             amp=amp,
             cpu=cpu,
             slurm=slurm,
-            noddp=noddp,
             name=name,
             gp_gpus=gp_gpus,
+            inference_only=inference_only,
         )
 
     def train(self, disable_eval_tqdm: bool = False) -> None:
@@ -148,7 +151,6 @@ class OCPTrainer(BaseTrainer):
 
                 # Get a batch.
                 batch = next(train_loader_iter)
-
                 # Forward, loss, backward.
                 with torch.cuda.amp.autocast(enabled=self.scaler is not None):
                     out = self._forward(batch)
@@ -227,25 +229,40 @@ class OCPTrainer(BaseTrainer):
             if checkpoint_every == -1:
                 self.save(checkpoint_file="checkpoint.pt", training_state=True)
 
-        self.train_dataset.close_db()
-        if self.config.get("val_dataset", False):
-            self.val_dataset.close_db()
-        if self.config.get("test_dataset", False):
-            self.test_dataset.close_db()
+    def _denorm_preds(self, target_key: str, prediction: torch.Tensor, batch: Batch):
+        """Convert model output from a batch into raw prediction by denormalizing and adding references"""
+        # denorm the outputs
+        if target_key in self.normalizers:
+            prediction = self.normalizers[target_key](prediction)
+
+        # add element references
+        if target_key in self.elementrefs:
+            prediction = self.elementrefs[target_key](prediction, batch)
+
+        return prediction
 
     def _forward(self, batch):
         out = self.model(batch.to(self.device))
 
-        ### TODO: Move into BaseModel in OCP 2.0
         outputs = {}
         batch_size = batch.natoms.numel()
         num_atoms_in_batch = batch.natoms.sum()
         for target_key in self.output_targets:
             ### Target property is a direct output of the model
             if target_key in out:
-                pred = out[target_key]
-            ## Target property is a derived output of the model. Construct the
-            ## parent property
+                if isinstance(out[target_key], torch.Tensor):
+                    pred = out[target_key]
+                elif isinstance(out[target_key], dict):
+                    # if output is a nested dictionary (in the case of hydra models), we attempt to retrieve it using the property name
+                    # ie: "output_head_name.property"
+                    assert (
+                        "property" in self.output_targets[target_key]
+                    ), f"we need to know which property to match the target to, please specify the property field in the task config, current config: {self.output_targets[target_key]}"
+                    prop = self.output_targets[target_key]["property"]
+                    pred = out[target_key][prop]
+
+            ## TODO: deprecate the following logic?
+            ## Otherwise, assume target property is a derived output of the model. Construct the parent property
             else:
                 _max_rank = 0
                 for subtarget_key in self.output_targets[target_key]["decomposition"]:
@@ -260,10 +277,7 @@ class OCPTrainer(BaseTrainer):
 
                 for subtarget_key in self.output_targets[target_key]["decomposition"]:
                     irreps = self.output_targets[subtarget_key]["irrep_dim"]
-                    _pred = out[subtarget_key]
-
-                    if self.normalizers.get(subtarget_key, False):
-                        _pred = self.normalizers[subtarget_key].denorm(_pred)
+                    _pred = self._denorm_preds(subtarget_key, out[subtarget_key], batch)
 
                     ## Fill in the corresponding irreps prediction
                     ## Reshape irrep prediction to (batch_size, irrep_dim)
@@ -284,12 +298,11 @@ class OCPTrainer(BaseTrainer):
                 pred = pred.view(num_atoms_in_batch, -1)
             else:
                 pred = pred.view(batch_size, -1)
-
             outputs[target_key] = pred
 
         return outputs
 
-    def _compute_loss(self, out, batch):
+    def _compute_loss(self, out, batch) -> torch.Tensor:
         batch_size = batch.natoms.numel()
         fixed = batch.fixed
         mask = fixed == 0
@@ -313,14 +326,20 @@ class OCPTrainer(BaseTrainer):
                 natoms = natoms[mask]
 
             num_atoms_in_batch = natoms.numel()
-            if self.normalizers.get(target_name, False):
-                target = self.normalizers[target_name].norm(target)
 
             ### reshape accordingly: num_atoms_in_batch, -1 or num_systems_in_batch, -1
             if self.output_targets[target_name]["level"] == "atom":
                 target = target.view(num_atoms_in_batch, -1)
             else:
                 target = target.view(batch_size, -1)
+
+            # to keep the loss coefficient weights balanced we remove linear references
+            # subtract element references from target data
+            if target_name in self.elementrefs:
+                target = self.elementrefs[target_name].dereference(target, batch)
+            # normalize the targets data
+            if target_name in self.normalizers:
+                target = self.normalizers[target_name].norm(target)
 
             mult = loss_info["coefficient"]
             loss.append(
@@ -379,11 +398,8 @@ class OCPTrainer(BaseTrainer):
             else:
                 target = target.view(batch_size, -1)
 
+            out[target_name] = self._denorm_preds(target_name, out[target_name], batch)
             targets[target_name] = target
-            if self.normalizers.get(target_name, False):
-                out[target_name] = self.normalizers[target_name].denorm(
-                    out[target_name]
-                )
 
         targets["natoms"] = natoms
         out["natoms"] = natoms
@@ -391,7 +407,7 @@ class OCPTrainer(BaseTrainer):
         return evaluator.eval(out, targets, prev_metrics=metrics)
 
     # Takes in a new data source and generates predictions on it.
-    @torch.no_grad()
+    @torch.no_grad
     def predict(
         self,
         data_loader,
@@ -425,7 +441,7 @@ class OCPTrainer(BaseTrainer):
 
         predictions = defaultdict(list)
 
-        for _i, batch in tqdm(
+        for _, batch in tqdm(
             enumerate(data_loader),
             total=len(data_loader),
             position=rank,
@@ -436,9 +452,7 @@ class OCPTrainer(BaseTrainer):
                 out = self._forward(batch)
 
             for target_key in self.config["outputs"]:
-                pred = out[target_key]
-                if self.normalizers.get(target_key, False):
-                    pred = self.normalizers[target_key].denorm(pred)
+                pred = self._denorm_preds(target_key, out[target_key], batch)
 
                 if per_image:
                     ### Save outputs in desired precision, default float16
@@ -455,7 +469,8 @@ class OCPTrainer(BaseTrainer):
                     else:
                         dtype = torch.float16
 
-                    pred = pred.cpu().detach().to(dtype)
+                    pred = pred.detach().cpu().to(dtype)
+
                     ### Split predictions into per-image predictions
                     if self.config["outputs"][target_key]["level"] == "atom":
                         batch_natoms = batch.natoms
@@ -516,6 +531,7 @@ class OCPTrainer(BaseTrainer):
 
         return predictions
 
+    @torch.no_grad
     def run_relaxations(self, split="val"):
         ensure_fitted(self._unwrapped_model)
 
